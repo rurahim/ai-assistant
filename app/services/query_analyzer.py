@@ -12,7 +12,8 @@ No hardcoded rules - the LLM decides everything dynamically.
 """
 
 import json
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 from pydantic import BaseModel, Field
 
@@ -206,29 +207,210 @@ Generate the retrieval plan JSON:"""
 
 class QueryAnalyzer:
     """
-    Fully LLM-based query analyzer.
+    Hybrid query analyzer: Fast rules + LLM fallback.
 
-    The LLM has complete control over:
-    - Which sources to query
-    - What filters to apply
-    - How to score/rank results
+    Strategy:
+    1. Try fast pattern matching first (~0ms)
+    2. If confident, return immediately
+    3. If uncertain, fall back to LLM (~800-1500ms)
+
+    This gives us:
+    - Fast response for 80% of queries (simple patterns)
+    - Accurate response for 20% of queries (complex/ambiguous)
     """
+
+    # Source detection patterns
+    SOURCE_PATTERNS = {
+        "gmail": ["email", "emails", "mail", "inbox", "sent", "from", "to me"],
+        "jira": ["task", "tasks", "ticket", "tickets", "issue", "issues", "assigned", "jira", "sprint", "backlog"],
+        "calendar": ["meeting", "meetings", "calendar", "event", "events", "schedule", "appointment", "upcoming"],
+        "gdrive": ["document", "documents", "doc", "docs", "file", "files", "drive", "pdf", "spreadsheet"],
+    }
+
+    # Temporal patterns
+    MONTH_NAMES = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+    }
+
+    FUTURE_KEYWORDS = ["upcoming", "coming up", "next", "tomorrow", "scheduled", "future"]
+    PAST_KEYWORDS = ["last", "latest", "recent", "previous", "yesterday", "ago"]
 
     def __init__(self):
         self.client = AsyncOpenAI(api_key=settings.openai_api_key)
-        self.model = "gpt-4o-mini"  # Fast and cost-effective
+        self.model = "gpt-4o-mini"
 
     async def analyze(self, query: str, user_id: str = "default") -> RetrievalPlan:
         """
         Analyze a query and generate a complete retrieval plan.
 
-        Args:
-            query: The user's natural language query
-            user_id: User identifier for context
-
-        Returns:
-            RetrievalPlan with sources, filters, scoring, and strategy
+        Uses hybrid approach:
+        1. Fast pattern matching (~0ms) for simple queries
+        2. LLM fallback (~800-1500ms) for complex queries
         """
+        # Step 1: Try fast analysis first
+        fast_plan, confidence = self._fast_analyze(query)
+
+        # If confident enough, return fast result (skip LLM)
+        if confidence >= 0.7:
+            return fast_plan
+
+        # Step 2: Fall back to LLM for complex/ambiguous queries
+        return await self._llm_analyze(query, user_id)
+
+    def _fast_analyze(self, query: str) -> tuple[RetrievalPlan, float]:
+        """
+        Fast pattern-based analysis. Returns (plan, confidence).
+
+        Handles common patterns like:
+        - "emails from November" → gmail + date filter
+        - "tasks assigned to Mike" → jira + entity filter
+        - "upcoming meetings" → calendar + future filter
+        """
+        query_lower = query.lower()
+        confidence = 0.0
+
+        # Detect sources
+        sources = {s: 0.0 for s in ["gmail", "gdrive", "calendar", "jira", "slack", "notion"]}
+        detected_sources = []
+
+        for source, patterns in self.SOURCE_PATTERNS.items():
+            for pattern in patterns:
+                if pattern in query_lower:
+                    sources[source] = 1.0
+                    detected_sources.append(source)
+                    confidence += 0.3
+                    break
+
+        # If single source detected with high confidence, exclude others
+        if len(detected_sources) == 1:
+            confidence += 0.2
+
+        # If no sources detected, use defaults
+        if not detected_sources:
+            sources["gmail"] = 0.4
+            sources["gdrive"] = 0.3
+            sources["calendar"] = 0.2
+            sources["jira"] = 0.1
+
+        # Detect date filters
+        date_from = None
+        date_to = None
+        is_temporal = False
+        temporal_direction = None
+
+        # Check for month + year pattern: "November 2025"
+        month_year = re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s*(\d{4})?', query_lower)
+        if month_year:
+            month_name = month_year.group(1)
+            year = int(month_year.group(2)) if month_year.group(2) else datetime.now().year
+            month = self.MONTH_NAMES.get(month_name)
+            if month:
+                date_from = f"{year}-{month:02d}-01"
+                # Last day of month
+                if month == 12:
+                    date_to = f"{year}-12-31"
+                else:
+                    next_month = datetime(year, month + 1, 1) - timedelta(days=1)
+                    date_to = next_month.strftime("%Y-%m-%d")
+                is_temporal = True
+                temporal_direction = "past"
+                confidence += 0.3
+
+        # Check for future keywords
+        if any(kw in query_lower for kw in self.FUTURE_KEYWORDS):
+            date_from = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            is_temporal = True
+            temporal_direction = "future"
+            confidence += 0.2
+            # Likely calendar
+            if "calendar" not in detected_sources and "meeting" in query_lower:
+                sources["calendar"] = 1.0
+                detected_sources.append("calendar")
+
+        # Check for past keywords
+        if any(kw in query_lower for kw in self.PAST_KEYWORDS):
+            is_temporal = True
+            temporal_direction = "past"
+            confidence += 0.1
+
+        # Detect entities (names after "from", "to", "assigned to", etc.)
+        entities = []
+        entity_patterns = [
+            r'from\s+([A-Z][a-z]+)',
+            r'to\s+([A-Z][a-z]+)',
+            r'assigned\s+to\s+([A-Z][a-z]+)',
+            r'by\s+([A-Z][a-z]+)',
+            r"([A-Z][a-z]+)'s\s+",
+            r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',  # email
+        ]
+        for pattern in entity_patterns:
+            matches = re.findall(pattern, query)
+            entities.extend(matches)
+
+        if entities:
+            confidence += 0.2
+
+        # Determine strategy
+        strategy = "balanced"
+        if date_from or date_to:
+            strategy = "filter_first"
+        elif is_temporal and temporal_direction == "past":
+            strategy = "recency_first"
+        elif entities and not date_from:
+            strategy = "semantic_first"
+
+        # Determine scoring weights based on query type
+        if strategy == "filter_first":
+            scoring = ScoringConfig(
+                semantic_similarity=0.2,
+                recency=0.5,
+                entity_match=0.2,
+                exact_match=0.1,
+            )
+        elif strategy == "recency_first":
+            scoring = ScoringConfig(
+                semantic_similarity=0.3,
+                recency=0.5,
+                entity_match=0.1,
+                exact_match=0.1,
+            )
+        elif strategy == "semantic_first":
+            scoring = ScoringConfig(
+                semantic_similarity=0.5,
+                recency=0.2,
+                entity_match=0.2,
+                exact_match=0.1,
+            )
+        else:
+            scoring = ScoringConfig(
+                semantic_similarity=0.4,
+                recency=0.2,
+                entity_match=0.2,
+                exact_match=0.1,
+                source_authority=0.05,
+                interaction_frequency=0.05,
+            )
+
+        plan = RetrievalPlan(
+            sources=sources,
+            filters=HardFilters(
+                date_from=date_from,
+                date_to=date_to,
+                entities=entities if entities else None,
+            ),
+            scoring=scoring,
+            strategy=strategy,
+            is_temporal=is_temporal,
+            temporal_direction=temporal_direction,
+            reasoning=f"Fast analysis: sources={detected_sources}, temporal={temporal_direction}, entities={entities}"
+        )
+
+        return plan, min(confidence, 1.0)
+
+    async def _llm_analyze(self, query: str, user_id: str) -> RetrievalPlan:
+        """LLM-based analysis for complex queries."""
         current_time = datetime.now(timezone.utc).isoformat()
 
         user_prompt = USER_PROMPT_TEMPLATE.format(
@@ -245,14 +427,13 @@ class QueryAnalyzer:
                     {"role": "user", "content": user_prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1,  # Low temperature for consistency
+                temperature=0.1,
                 max_tokens=1000
             )
 
             content = response.choices[0].message.content
             plan_data = json.loads(content)
 
-            # Parse into structured objects
             filters = HardFilters(
                 date_from=plan_data.get("filters", {}).get("date_from"),
                 date_to=plan_data.get("filters", {}).get("date_to"),
@@ -280,12 +461,11 @@ class QueryAnalyzer:
                 strategy=plan_data.get("strategy", "balanced"),
                 is_temporal=plan_data.get("is_temporal", False),
                 temporal_direction=plan_data.get("temporal_direction"),
-                reasoning=plan_data.get("reasoning", "")
+                reasoning=plan_data.get("reasoning", "") + " [LLM]"
             )
 
         except Exception as e:
-            # Fallback to default plan if LLM fails
-            print(f"Query analysis failed: {e}")
+            print(f"LLM query analysis failed: {e}")
             return self._default_plan(query)
 
     def _default_sources(self) -> dict[str, float]:

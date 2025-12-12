@@ -13,6 +13,7 @@ Memory Types Retrieved:
 - Working Memory: Current session context (via Redis)
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Union, Optional
 from uuid import UUID
@@ -276,34 +277,29 @@ class ContextService:
         date_to: Optional[datetime],
         limit: int,
     ) -> list[dict]:
-        """Execute balanced strategy: combine all approaches."""
+        """Execute balanced strategy: combine all approaches IN PARALLEL."""
+        # Build list of coroutines to run in parallel
+        tasks = []
+
+        # Always run semantic and fulltext search
+        tasks.append(self._semantic_search(db, user_id, query, sources, date_from, date_to, limit))
+        tasks.append(self._fulltext_search(db, user_id, query, sources, date_from, date_to, limit))
+
+        # Add entity searches if entities specified
+        if plan.filters.entities:
+            tasks.append(self._search_by_entities(db, user_id, plan.filters.entities, sources, date_from, date_to, limit))
+            tasks.append(self._metadata_search(db, user_id, plan.filters.entities, sources, date_from, date_to, limit))
+
+        # Run all searches in parallel
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Flatten results, ignoring exceptions
         results = []
-
-        # 1. Entity search if entities specified
-        if plan.filters.entities:
-            entity_results = await self._search_by_entities(
-                db, user_id, plan.filters.entities, sources, date_from, date_to, limit
-            )
-            results.extend(entity_results)
-
-        # 2. Semantic search
-        semantic_results = await self._semantic_search(
-            db, user_id, query, sources, date_from, date_to, limit
-        )
-        results.extend(semantic_results)
-
-        # 3. Fulltext search
-        fts_results = await self._fulltext_search(
-            db, user_id, query, sources, date_from, date_to, limit
-        )
-        results.extend(fts_results)
-
-        # 4. Metadata search for entities
-        if plan.filters.entities:
-            metadata_results = await self._metadata_search(
-                db, user_id, plan.filters.entities, sources, date_from, date_to, limit
-            )
-            results.extend(metadata_results)
+        for result in all_results:
+            if isinstance(result, list):
+                results.extend(result)
+            elif isinstance(result, Exception):
+                print(f"Search task failed: {result}")
 
         return self._deduplicate(results)
 
