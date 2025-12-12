@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(docker compose:*)",
+      "Bash(lsof:*)",
+      "Bash(xargs kill:*)",
+      "Bash(docker info:*)",
+      "Bash(for i in {1..12})",
+      "Bash(do docker info)",
+      "Bash(break)",
+      "Bash(done)",
+      "Bash(for i in {1..20})",
+      "Bash(do)",
+      "Bash(pgrep:*)",
+      "Bash(pkill:*)",
+      "Bash(open:*)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nInitial commit - AI Assistant API\n\nFastAPI-based AI assistant with multi-agent system featuring:\n- PostgreSQL with pgvector for embeddings\n- Redis for caching and Celery broker\n- Multi-agent architecture (email, document, task agents)\n- Context retrieval and entity extraction\n- Docker Compose setup for all services\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n)\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
