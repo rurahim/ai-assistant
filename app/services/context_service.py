@@ -553,15 +553,16 @@ class ContextService:
         for entity in entities:
             entity_lower = entity.lower()
 
-            # Search in metadata as text
-            metadata_text = func.lower(cast(KnowledgeItem.item_metadata, Text))
+            # Search in metadata as text using PostgreSQL's native text search
+            # Cast JSONB to text and use ILIKE for case-insensitive search
+            metadata_as_text = cast(KnowledgeItem.item_metadata, Text)
 
             stmt = (
                 select(KnowledgeItem)
                 .where(
                     KnowledgeItem.user_id == str(user_id),
                     KnowledgeItem.source_type.in_(sources),
-                    metadata_text.contains(entity_lower),
+                    metadata_as_text.ilike(f"%{entity_lower}%"),
                 )
             )
 

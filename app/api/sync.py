@@ -2,7 +2,10 @@
 Sync API endpoints.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from typing import Optional
+from pydantic import BaseModel
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +24,14 @@ router = APIRouter(prefix="/sync")
 
 
 VALID_SOURCES = {"gmail", "gdrive", "jira", "calendar", "outlook", "onedrive"}
+
+DEFAULT_SOURCES = ["gmail", "gdrive", "jira", "calendar"]
+
+
+class BulkSyncRequest(BaseModel):
+    """Request for bulk sync of all users."""
+    sources: list[str] = DEFAULT_SOURCES
+    config: Optional[dict] = None
 
 
 async def get_user(db: AsyncSession, external_user_id: str) -> User:
@@ -276,4 +287,210 @@ async def clear_sync_data(
         "source": source,
         "deleted_items": deleted_count,
         "message": f"Cleared {deleted_count} items from {source}",
+    }
+
+
+@router.get("/users")
+async def list_sync_users(
+    limit: int = Query(default=100, le=1000),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List all users available for sync.
+
+    This fetches users from the external database that have connected accounts.
+    Use this to discover user IDs before initiating sync.
+    """
+    from external_db.database import get_local_db_context
+    from sqlalchemy import text
+
+    try:
+        async with get_local_db_context() as ext_db:
+            # Get users with their connected accounts
+            result = await ext_db.execute(
+                text("""
+                    SELECT DISTINCT u.id, u.email, u.name,
+                           array_agg(DISTINCT a.provider) as providers
+                    FROM users u
+                    LEFT JOIN accounts a ON a.user_id = u.id AND a.is_active = true
+                    GROUP BY u.id, u.email, u.name
+                    ORDER BY u.email
+                    LIMIT :limit OFFSET :offset
+                """),
+                {"limit": limit, "offset": offset}
+            )
+            rows = result.fetchall()
+
+            # Get total count
+            count_result = await ext_db.execute(
+                text("SELECT COUNT(DISTINCT id) FROM users")
+            )
+            total = count_result.scalar()
+
+            users = []
+            for row in rows:
+                providers = row.providers if row.providers and row.providers[0] else []
+                users.append({
+                    "user_id": str(row.id),
+                    "email": row.email,
+                    "name": row.name,
+                    "connected_providers": [p for p in providers if p],
+                })
+
+            return {
+                "users": users,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch users from external database: {str(e)}"
+        )
+
+
+@router.post("/all")
+async def bulk_sync_all_users(
+    request: BulkSyncRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Initiate sync for ALL users in the external database.
+
+    This is useful for initial setup or periodic full re-sync.
+    Syncs are run in background for each user.
+    """
+    from external_db.database import get_local_db_context
+    from sqlalchemy import text
+
+    # Validate sources
+    invalid_sources = set(request.sources) - VALID_SOURCES
+    if invalid_sources:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sources: {invalid_sources}. Valid: {VALID_SOURCES}",
+        )
+
+    try:
+        # Get all users from external database
+        async with get_local_db_context() as ext_db:
+            result = await ext_db.execute(
+                text("SELECT DISTINCT id, email FROM users ORDER BY email")
+            )
+            external_users = result.fetchall()
+
+        if not external_users:
+            return {
+                "status": "no_users",
+                "message": "No users found in external database. Run external sync first.",
+                "users_queued": 0,
+            }
+
+        # Queue sync for each user
+        queued_users = []
+        for ext_user in external_users:
+            external_user_id = str(ext_user.id)
+
+            # Get or create user in our database
+            user = await get_user(db, external_user_id)
+            await db.commit()
+
+            # Queue background sync
+            background_tasks.add_task(
+                run_sync_background,
+                str(user.id),
+                request.sources,
+                request.config,
+            )
+
+            queued_users.append({
+                "user_id": external_user_id,
+                "email": ext_user.email,
+            })
+
+        return {
+            "status": "started",
+            "message": f"Bulk sync started for {len(queued_users)} users",
+            "sources": request.sources,
+            "users_queued": len(queued_users),
+            "users": queued_users,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initiate bulk sync: {str(e)}"
+        )
+
+
+@router.get("/status")
+async def get_all_sync_status(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get sync status for ALL users.
+
+    Returns aggregated sync status across all users.
+    """
+    # Get all users with their sync status
+    stmt = select(User).order_by(User.email)
+    result = await db.execute(stmt)
+    users = result.scalars().all()
+
+    user_statuses = []
+    for user in users:
+        # Get sync records for this user
+        sync_stmt = select(IntegrationSync).where(IntegrationSync.user_id == user.id)
+        sync_result = await db.execute(sync_stmt)
+        syncs = sync_result.scalars().all()
+
+        sources = {}
+        for s in syncs:
+            sources[s.source_type] = {
+                "status": s.status,
+                "items_synced": s.items_synced,
+                "last_sync_at": s.last_sync_at.isoformat() if s.last_sync_at else None,
+                "error": s.error_message,
+            }
+
+        # Determine overall status for this user
+        statuses = [s.status for s in syncs]
+        if not statuses:
+            overall = "not_started"
+        elif all(s == "completed" for s in statuses):
+            overall = "completed"
+        elif any(s == "syncing" for s in statuses):
+            overall = "syncing"
+        elif any(s == "failed" for s in statuses):
+            overall = "partial_failure" if any(s == "completed" for s in statuses) else "failed"
+        else:
+            overall = "pending"
+
+        user_statuses.append({
+            "user_id": user.external_user_id,
+            "email": user.email,
+            "overall_status": overall,
+            "sources": sources,
+        })
+
+    # Calculate summary
+    total_users = len(user_statuses)
+    completed = sum(1 for u in user_statuses if u["overall_status"] == "completed")
+    syncing = sum(1 for u in user_statuses if u["overall_status"] == "syncing")
+    failed = sum(1 for u in user_statuses if u["overall_status"] in ["failed", "partial_failure"])
+    not_started = sum(1 for u in user_statuses if u["overall_status"] == "not_started")
+
+    return {
+        "summary": {
+            "total_users": total_users,
+            "completed": completed,
+            "syncing": syncing,
+            "failed": failed,
+            "not_started": not_started,
+        },
+        "users": user_statuses,
     }

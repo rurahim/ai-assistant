@@ -17,8 +17,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Database
-    database_url: str = "postgresql+asyncpg://ai_assistant:ai_assistant_secret@localhost:5432/ai_assistant_db"
+    # Database - Using unified external database (synced data + AI features)
+    database_url: str = "postgresql+asyncpg://ai_assistant:ai_assistant_secret@localhost:5433/external_data_db"
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"

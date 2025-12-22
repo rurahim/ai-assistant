@@ -1,254 +1,307 @@
 """
-Email Agent - Specialist for email drafting and analysis.
+Email Agent - Email drafting, summarization, and action extraction.
+
+Handles:
+- Drafting emails and replies
+- Summarizing email threads
+- Extracting action items from emails
+- Suggesting appropriate responses
 """
 
 import json
-from typing import Optional
 import uuid
+from typing import Optional
 
+from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.base import BaseAgent, AgentState, AgentResponse, Tool
+from app.config import get_settings
+from app.schemas.agent_schemas import (
+    Action,
+    AgentOutput,
+    ClarificationQuestion,
+    MemoryContext,
+)
 
-EMAIL_AGENT_SYSTEM_PROMPT = """You are an expert email specialist. Your job is to:
+settings = get_settings()
+
+
+EMAIL_SYSTEM_PROMPT = """You are an expert email specialist agent. Your job is to:
 1. Draft professional, well-structured emails
 2. Summarize email threads
 3. Extract action items from emails
 4. Suggest appropriate responses
 
-## Guidelines:
-- Match the user's preferred tone (professional, casual, formal)
-- Keep emails concise but complete
-- Include all necessary context
-- Use appropriate greetings and sign-offs
-- Structure longer emails with clear sections
+## Available Context
+You will receive:
+- User's request
+- Relevant emails from memory (or ad-hoc email in attachments)
+- Entity information (names → emails)
+- User preferences (signature, tone, etc.)
 
-## Available Context:
-You may receive context including:
-- Previous emails in the thread
-- Related documents or tasks
-- Entity information (people's emails, roles)
-- User preferences for email style
+## Output Format
+Return a JSON object with:
+{{
+    "action": "draft_email" | "summarize" | "extract_actions" | "answer",
+    "email_details": {{
+        "to": ["email@domain.com"],
+        "cc": ["cc@domain.com"],
+        "subject": "Email subject",
+        "body": "Email body content",
+        "reply_to_id": "optional_message_id"
+    }},
+    "summary": "Thread summary if summarizing",
+    "action_items": [
+        {{"task": "description", "assignee": "person", "due": "date"}}
+    ],
+    "message": "Human-readable response",
+    "needs_clarification": true/false,
+    "clarification_questions": [
+        {{"field": "recipient", "question": "Who should I send this to?"}}
+    ]
+}}
 
-## Output Format:
-When drafting emails, structure them clearly with:
-- To/CC/BCC (if applicable)
-- Subject line
-- Email body
-- Sign-off"""
+## Email Guidelines
+1. Match the user's preferred tone (professional/casual/formal)
+2. Keep emails concise but complete
+3. Include appropriate greetings and sign-offs
+4. Use the user's signature if provided
+5. When replying, reference the original email context
+6. For summaries, highlight key points and action items
+
+## User Preferences
+{preferences}
+
+Only output valid JSON."""
 
 
-class EmailAgent(BaseAgent):
-    """Email specialist agent for drafting and analyzing emails."""
+class EmailAgent:
+    """Email drafting and analysis agent."""
 
-    def __init__(self, db: AsyncSession):
-        super().__init__(
-            name="email_agent",
-            system_prompt=EMAIL_AGENT_SYSTEM_PROMPT,
-        )
+    def __init__(self, db: AsyncSession, openai_client: Optional[AsyncOpenAI] = None):
         self.db = db
-        self._register_tools()
+        self.client = openai_client or AsyncOpenAI(api_key=settings.openai_api_key)
+        self.model = settings.chat_model
 
-    def _register_tools(self) -> None:
-        """Register email-specific tools."""
-
-        # Draft Email Tool
-        self.register_tool(Tool(
-            name="draft_email",
-            description="Draft an email with given parameters",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "to": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of recipient email addresses",
-                    },
-                    "cc": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional CC recipients",
-                    },
-                    "subject": {
-                        "type": "string",
-                        "description": "Email subject line",
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Email body content",
-                    },
-                    "reply_to_id": {
-                        "type": "string",
-                        "description": "ID of email to reply to (if replying)",
-                    },
-                    "tone": {
-                        "type": "string",
-                        "enum": ["professional", "casual", "formal"],
-                        "description": "Desired tone of the email",
-                    },
-                },
-                "required": ["to", "subject", "body"],
-            },
-            handler=self._handle_draft_email,
-        ))
-
-        # Summarize Thread Tool
-        self.register_tool(Tool(
-            name="summarize_email_thread",
-            description="Summarize an email thread",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "include_action_items": {
-                        "type": "boolean",
-                        "description": "Whether to extract action items",
-                    },
-                    "include_decisions": {
-                        "type": "boolean",
-                        "description": "Whether to highlight decisions made",
-                    },
-                },
-                "required": [],
-            },
-            handler=self._handle_summarize_thread,
-        ))
-
-        # Extract Action Items Tool
-        self.register_tool(Tool(
-            name="extract_action_items",
-            description="Extract action items from email content",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "assign_to_entities": {
-                        "type": "boolean",
-                        "description": "Try to assign action items to mentioned people",
-                    },
-                },
-                "required": [],
-            },
-            handler=self._handle_extract_action_items,
-        ))
-
-    async def _handle_draft_email(
+    async def process(
         self,
-        state: AgentState,
-        to: list[str],
-        subject: str,
-        body: str,
-        cc: Optional[list[str]] = None,
-        reply_to_id: Optional[str] = None,
-        tone: str = "professional",
-    ) -> dict:
-        """Handle email drafting."""
-        # Get user's email preferences
-        email_prefs = state.preferences.get("email", {})
-        signature = email_prefs.get("signature", {}).get("value", "Best regards")
+        message: str,
+        context: MemoryContext,
+        user_id: str,
+    ) -> AgentOutput:
+        """
+        Process an email-related request.
 
-        # Apply tone adjustments
-        if tone == "casual" and body.startswith("Dear "):
-            body = body.replace("Dear ", "Hi ")
+        Args:
+            message: User's message
+            context: Retrieved context from Memory Agent
+            user_id: User ID
 
-        # Add signature if not already present
-        if signature and signature not in body:
-            body = f"{body}\n\n{signature}"
+        Returns:
+            AgentOutput with action or answer
+        """
+        # Build context
+        email_context = self._build_email_context(context)
+        entities_text = self._build_entities_text(context.entities)
+        preferences = self._extract_email_preferences(context.user_preferences)
 
-        # Create pending action
-        action_id = str(uuid.uuid4())[:8]
-        action = {
-            "id": f"act_{action_id}",
-            "type": "send_email",
-            "params": {
-                "to": to,
-                "cc": cc,
-                "subject": subject,
-                "body": body,
-                "reply_to_id": reply_to_id,
-            },
-            "description": f"Send email to {', '.join(to)}: {subject}",
-            "status": "pending_confirmation",
-        }
+        user_prompt = f"""User Request: "{message}"
 
-        state.pending_actions.append(action)
+## Email Context
+{email_context}
 
-        return {
-            "draft": {
-                "to": to,
-                "cc": cc,
-                "subject": subject,
-                "body": body,
-            },
-            "action_id": action["id"],
-            "status": "draft_ready",
-        }
+## Known Entities (Name → Email)
+{entities_text}
 
-    async def _handle_summarize_thread(
+Process this request and return JSON:"""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": EMAIL_SYSTEM_PROMPT.format(
+                        preferences=json.dumps(preferences, indent=2)
+                    )},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.4,
+                max_tokens=2000
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            return self._process_result(result, user_id, preferences)
+
+        except Exception as e:
+            return AgentOutput(
+                agent_name="email",
+                success=False,
+                message=f"Failed to process email request: {str(e)}",
+            )
+
+    def _process_result(
         self,
-        state: AgentState,
-        include_action_items: bool = True,
-        include_decisions: bool = True,
-    ) -> dict:
-        """Handle email thread summarization."""
-        # Get email context
-        emails = [
-            item for item in state.context_items
+        result: dict,
+        user_id: str,
+        preferences: dict
+    ) -> AgentOutput:
+        """Process LLM result into AgentOutput."""
+        action_type = result.get("action", "answer")
+        message = result.get("message", "")
+        needs_clarification = result.get("needs_clarification", False)
+
+        # Handle clarification
+        if needs_clarification:
+            clarifications = [
+                ClarificationQuestion(
+                    field=q.get("field", "unknown"),
+                    question=q.get("question", ""),
+                    options=q.get("options"),
+                    required=True
+                )
+                for q in result.get("clarification_questions", [])
+            ]
+            return AgentOutput(
+                agent_name="email",
+                success=True,
+                message=message,
+                clarifications=clarifications,
+            )
+
+        # Handle email drafting
+        if action_type == "draft_email":
+            email = result.get("email_details", {})
+
+            # Apply signature if not present
+            body = email.get("body", "")
+            signature = preferences.get("signature", "Best regards")
+            if signature and signature not in body:
+                body = f"{body}\n\n{signature}"
+
+            action_id = f"act_{uuid.uuid4().hex[:8]}"
+            action = Action(
+                id=action_id,
+                type="send_email",
+                status="needs_confirmation",
+                payload={
+                    "to": email.get("to", []),
+                    "cc": email.get("cc", []),
+                    "bcc": email.get("bcc", []),
+                    "subject": email.get("subject", ""),
+                    "body": body,
+                    "reply_to_id": email.get("reply_to_id"),
+                    "attachments": [],
+                },
+                preview=self._generate_preview(email, body),
+                missing_fields=[],
+            )
+
+            return AgentOutput(
+                agent_name="email",
+                success=True,
+                message=message,
+                action=action,
+            )
+
+        # Handle summarization
+        if action_type == "summarize":
+            return AgentOutput(
+                agent_name="email",
+                success=True,
+                message=message,
+                data={
+                    "summary": result.get("summary"),
+                    "action_items": result.get("action_items", []),
+                }
+            )
+
+        # Handle action extraction
+        if action_type == "extract_actions":
+            return AgentOutput(
+                agent_name="email",
+                success=True,
+                message=message,
+                data={
+                    "action_items": result.get("action_items", []),
+                }
+            )
+
+        # Default answer
+        return AgentOutput(
+            agent_name="email",
+            success=True,
+            message=message,
+        )
+
+    def _build_email_context(self, context: MemoryContext) -> str:
+        """Build email context from memory items."""
+        # First check for attachments (ad-hoc content)
+        attachment_emails = [
+            item for item in context.items
+            if item.get("source") == "attachment" and item.get("content_type") == "email"
+        ]
+
+        # Then get emails from DB
+        db_emails = [
+            item for item in context.items
             if item.get("source") in ("gmail", "outlook")
         ]
 
+        emails = attachment_emails + db_emails
+
         if not emails:
-            return {"error": "No email context available"}
+            return "No relevant emails found."
 
-        # Build summary using context
-        summary_parts = []
-        participants = set()
-        action_items = []
-        decisions = []
+        lines = []
+        for item in emails[:10]:
+            title = item.get("title", "Untitled")
+            metadata = item.get("metadata", {})
+            from_addr = metadata.get("from", "Unknown")
+            content = item.get("content", item.get("summary", ""))[:500]
 
-        for email in emails:
-            # Collect participants
-            metadata = email.get("metadata", {})
-            if metadata.get("from"):
-                participants.add(metadata["from"])
-            for to in metadata.get("to", []):
-                participants.add(to)
+            lines.append(f"---")
+            lines.append(f"From: {from_addr}")
+            lines.append(f"Subject: {title}")
+            lines.append(f"Content: {content}")
 
+        return "\n".join(lines)
+
+    def _build_entities_text(self, entities: dict[str, dict]) -> str:
+        """Build entities text."""
+        if not entities:
+            return "No known entities."
+
+        lines = []
+        for name, details in entities.items():
+            email = details.get("email", "")
+            if email:
+                lines.append(f"- {name}: {email}")
+
+        return "\n".join(lines) if lines else "No known entities."
+
+    def _extract_email_preferences(self, preferences: dict) -> dict:
+        """Extract email-specific preferences."""
+        email_prefs = preferences.get("email", {})
         return {
-            "summary": "Thread summary based on context",
-            "participants": list(participants),
-            "email_count": len(emails),
-            "action_items": action_items if include_action_items else None,
-            "decisions": decisions if include_decisions else None,
+            "tone": email_prefs.get("tone", {}).get("value", "professional"),
+            "signature": email_prefs.get("signature", {}).get("value", "Best regards"),
         }
 
-    async def _handle_extract_action_items(
-        self,
-        state: AgentState,
-        assign_to_entities: bool = True,
-    ) -> dict:
-        """Handle action item extraction."""
-        # This would use LLM to extract action items from context
-        action_items = []
+    def _generate_preview(self, email: dict, body: str) -> str:
+        """Generate human-readable email preview."""
+        to = email.get("to", [])
+        cc = email.get("cc", [])
+        subject = email.get("subject", "No Subject")
 
-        for item in state.context_items:
-            content = item.get("summary") or item.get("content", "")
-            # Action items would be extracted here
-            # For now, return placeholder structure
+        lines = [
+            f"To: {', '.join(to)}",
+        ]
 
-        return {
-            "action_items": action_items,
-            "total": len(action_items),
-        }
+        if cc:
+            lines.append(f"CC: {', '.join(cc)}")
 
-    async def run(self, state: AgentState) -> AgentResponse:
-        """Run the email agent."""
-        # Add email-specific context to system prompt
-        email_prefs = state.preferences.get("email", {})
-        tone = email_prefs.get("tone", {}).get("value", "professional")
+        lines.append(f"Subject: {subject}")
+        lines.append("")
+        lines.append(body[:500] + ("..." if len(body) > 500 else ""))
 
-        additional_context = f"\n## User Preferences:\n- Preferred tone: {tone}"
-
-        # Run with tools
-        response = await self.run_with_tools(state)
-        response.pending_actions = state.pending_actions
-
-        return response
+        return "\n".join(lines)

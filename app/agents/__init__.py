@@ -2,28 +2,40 @@
 Multi-agent system for the AI Assistant.
 
 Agents:
-- OrchestratorAgent: Main coordinator
+- AgentOrchestrator: Main coordinator (routes to specialist agents)
+- TriageAgent: LLM-based intent classification
+- MemoryAgent: Centralized RAG context retrieval
 - EmailAgent: Email drafting and analysis
+- CalendarAgent: Meeting scheduling and calendar management
+- JiraAgent: Task/ticket creation and management
 - DocumentAgent: Document creation and summarization
-- TaskAgent: Task extraction and Jira management
-- ActionExecutor: External action execution
 """
 
 from app.agents.base import BaseAgent, AgentState, Tool, ToolResult
-from app.agents.orchestrator import OrchestratorAgent
+from app.agents.orchestrator import AgentOrchestrator, create_orchestrator
+from app.agents.triage_agent import TriageAgent, get_triage_agent
+from app.agents.memory_agent import MemoryAgent
 from app.agents.email_agent import EmailAgent
+from app.agents.calendar_agent import CalendarAgent
+from app.agents.jira_agent import JiraAgent
 from app.agents.document_agent import DocumentAgent
-from app.agents.task_agent import TaskAgent
-from app.agents.action_executor import ActionExecutor
 
 __all__ = [
+    # Base classes
     "BaseAgent",
     "AgentState",
     "Tool",
     "ToolResult",
-    "OrchestratorAgent",
+    # Main orchestrator
+    "AgentOrchestrator",
+    "create_orchestrator",
+    # Core agents
+    "TriageAgent",
+    "get_triage_agent",
+    "MemoryAgent",
+    # Specialist agents
     "EmailAgent",
+    "CalendarAgent",
+    "JiraAgent",
     "DocumentAgent",
-    "TaskAgent",
-    "ActionExecutor",
 ]
