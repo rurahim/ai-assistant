@@ -299,25 +299,26 @@ async def list_sync_users(
     """
     List all users available for sync.
 
-    This fetches users from the external database that have connected accounts.
+    This fetches users from the external database (gmail_outlook_db) that have connected accounts.
     Use this to discover user IDs before initiating sync.
     """
-    from external_db.database import get_local_db_context
+    from external_db.database import get_external_db_context
     from sqlalchemy import text
 
     try:
-        async with get_local_db_context() as ext_db:
+        async with get_external_db_context() as ext_db:
             # Get users with their connected accounts
+            # Note: gmail_outlook_db uses camelCase column names
             result = await ext_db.execute(
-                text("""
+                text('''
                     SELECT DISTINCT u.id, u.email, u.name,
                            array_agg(DISTINCT a.provider) as providers
                     FROM users u
-                    LEFT JOIN accounts a ON a.user_id = u.id AND a.is_active = true
+                    LEFT JOIN accounts a ON a."userId" = u.id AND a."isActive" = true
                     GROUP BY u.id, u.email, u.name
                     ORDER BY u.email
                     LIMIT :limit OFFSET :offset
-                """),
+                '''),
                 {"limit": limit, "offset": offset}
             )
             rows = result.fetchall()
@@ -364,7 +365,7 @@ async def bulk_sync_all_users(
     This is useful for initial setup or periodic full re-sync.
     Syncs are run in background for each user.
     """
-    from external_db.database import get_local_db_context
+    from external_db.database import get_external_db_context
     from sqlalchemy import text
 
     # Validate sources
@@ -376,8 +377,8 @@ async def bulk_sync_all_users(
         )
 
     try:
-        # Get all users from external database
-        async with get_local_db_context() as ext_db:
+        # Get all users from external database (gmail_outlook_db)
+        async with get_external_db_context() as ext_db:
             result = await ext_db.execute(
                 text("SELECT DISTINCT id, email FROM users ORDER BY email")
             )

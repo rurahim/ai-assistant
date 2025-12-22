@@ -17,8 +17,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Database - Using unified external database (synced data + AI features)
-    database_url: str = "postgresql+asyncpg://ai_assistant:ai_assistant_secret@localhost:5433/external_data_db"
+    # Database - Remote Azure database at ai-employee-agent.ibhc.ai
+    database_url: str = "postgresql+asyncpg://postgres:tiquaequoSie3Ied@ai-employee-agent.ibhc.ai:5432/ai_assistant_db"
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"

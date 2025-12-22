@@ -32,10 +32,12 @@ class ExternalDBSettings(BaseSettings):
     external_db_user: str = "postgres"
     external_db_password: str = "tiquaequoSie3Ied"
 
-    # Local Database (for storing synced data)
-    local_db_name: str = "external_data_db"
-    local_db_user: str = "ai_assistant"
-    local_db_password: str = "ai_assistant_secret"
+    # Local Database (for storing synced data) - uses same remote server
+    local_db_host: str = "ai-employee-agent.ibhc.ai"
+    local_db_port: int = 5432
+    local_db_name: str = "ai_assistant_db"
+    local_db_user: str = "postgres"
+    local_db_password: str = "tiquaequoSie3Ied"
 
     # Sync Settings
     sync_batch_size: int = 100
@@ -54,30 +56,18 @@ class ExternalDBSettings(BaseSettings):
 
     @property
     def local_database_url(self) -> str:
-        """Async database URL for the local database.
-
-        Auto-detects Docker environment and uses appropriate host/port.
-        """
-        # Check environment at runtime, not at object creation
-        if _is_docker_environment():
-            host = "postgres"
-            port = 5432
-        else:
-            host = "localhost"
-            port = 5433
-
+        """Async database URL for the local database (same remote server)."""
         return (
             f"postgresql+asyncpg://{self.local_db_user}:{self.local_db_password}"
-            f"@{host}:{port}/{self.local_db_name}"
+            f"@{self.local_db_host}:{self.local_db_port}/{self.local_db_name}"
         )
 
     @property
     def local_sync_database_url(self) -> str:
         """Synchronous database URL for Alembic migrations."""
-        # For alembic, always use localhost since it runs outside Docker
         return (
             f"postgresql://{self.local_db_user}:{self.local_db_password}"
-            f"@localhost:5433/{self.local_db_name}"
+            f"@{self.local_db_host}:{self.local_db_port}/{self.local_db_name}"
         )
 
 
